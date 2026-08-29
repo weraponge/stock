@@ -1,7 +1,31 @@
+import random
+import time
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+
+
+def _fetch_info_with_retry(ticker: str, max_retries: int = 4) -> dict | None:
+    """Fetch a single ticker's info, backing off on Yahoo rate limits (429)."""
+    for attempt in range(max_retries):
+        try:
+            info = yf.Ticker(ticker).info
+            # A valid response has real fields; empty/garbage means a soft failure.
+            if info and info.get("symbol"):
+                return info
+            return info or None
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            is_rate_limit = "429" in msg or "too many requests" in msg
+            if attempt == max_retries - 1:
+                return None
+            # Exponential backoff with jitter; longer waits for explicit 429s.
+            base = 2.0 if is_rate_limit else 0.5
+            sleep_s = base * (2 ** attempt) + random.uniform(0, 0.5)
+            time.sleep(sleep_s)
+    return None
 
 st.set_page_config(
     page_title="Stock Screener",
@@ -13,14 +37,23 @@ st.title("📈 Stock Screener")
 st.markdown("Screen stocks by market cap, P/E ratio, price, and more.")
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_stock_data(tickers: list[str]) -> pd.DataFrame:
-    """Fetch stock data for a list of tickers."""
+    """Fetch stock data for a list of tickers, one at a time with throttling.
+
+    Yahoo Finance rate-limits bursts of requests (HTTP 429). We pace the
+    requests with a small delay and retry with exponential backoff.
+    """
     records = []
-    for ticker in tickers:
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
+    failed = []
+    progress = st.progress(0.0, text="Fetching stock data...")
+    total = len(tickers)
+
+    for idx, ticker in enumerate(tickers):
+        info = _fetch_info_with_retry(ticker)
+        if not info:
+            failed.append(ticker)
+        else:
             records.append(
                 {
                     "Ticker": ticker,
@@ -48,16 +81,37 @@ def get_stock_data(tickers: list[str]) -> pd.DataFrame:
                     "Volume": info.get("averageVolume", 0),
                 }
             )
-        except Exception:
-            continue
+
+        progress.progress((idx + 1) / total, text=f"Fetched {idx + 1}/{total}")
+        # Small pause between requests to stay under Yahoo's rate limit.
+        if idx < total - 1:
+            time.sleep(0.4 + random.uniform(0, 0.3))
+
+    progress.empty()
+
+    if failed:
+        st.warning(
+            f"Could not fetch {len(failed)} ticker(s) after retries "
+            f"(likely rate-limited by Yahoo): {', '.join(failed)}. "
+            "Try again in a minute or screen a smaller universe."
+        )
     return pd.DataFrame(records)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_price_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
-    """Fetch price history for a single ticker."""
-    stock = yf.Ticker(ticker)
-    return stock.history(period=period)
+    """Fetch price history for a single ticker with retry on rate limits."""
+    for attempt in range(4):
+        try:
+            hist = yf.Ticker(ticker).history(period=period)
+            if not hist.empty:
+                return hist
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if attempt == 3 or not ("429" in msg or "too many requests" in msg):
+                break
+            time.sleep(2.0 * (2 ** attempt) + random.uniform(0, 0.5))
+    return pd.DataFrame()
 
 
 # --- Predefined ticker lists ---
